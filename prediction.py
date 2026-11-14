@@ -77,7 +77,7 @@ class WorkloadPredictor:
         if self.model_type == 'lstm':
             # For LSTM, need sequence of length sequence_length
             if isinstance(recent_data, pd.DataFrame):
-                features = recent_data[['cpu_usage', 'ram_usage', 'requests']].values
+                features = recent_data[preprocessor.feature_columns].values
             else:
                 features = recent_data
             
@@ -104,11 +104,11 @@ class WorkloadPredictor:
                 df = recent_data.copy()
             else:
                 # Convert array to DataFrame (assuming columns: cpu, ram, requests)
-                df = pd.DataFrame(recent_data, columns=['cpu_usage', 'ram_usage', 'requests'])
+                df = pd.DataFrame(recent_data, columns=preprocessor.feature_columns)
             
             # Create lag features (assuming lookback=24)
             lookback = 24
-            features = ['cpu_usage', 'ram_usage', 'requests']
+            features = list(preprocessor.feature_columns)
             
             for col in features:
                 for lag in range(1, lookback + 1):
@@ -158,22 +158,19 @@ class WorkloadPredictor:
             pred = self.predict_next_step(current_data, preprocessor)
             predictions.append(pred)
             
-            # Append prediction to current_data for next iteration
-            # (For recursive prediction, we use predicted values)
+            # Advance the relative five-minute timeline. Auxiliary features
+            # not predicted by the model use their latest observed value.
             last_timestamp = current_data['timestamp'].iloc[-1]
-            next_timestamp = last_timestamp + pd.Timedelta(minutes=15)  # Assuming 15-min intervals
-            
-            # Estimate requests based on CPU (simple heuristic)
-            estimated_requests = int((pred['cpu_usage'] / 10) * np.random.uniform(50, 150))
-            
-            new_row = pd.DataFrame({
-                'timestamp': [next_timestamp],
-                'cpu_usage': [pred['cpu_usage']],
-                'ram_usage': [pred['ram_usage']],
-                'requests': [estimated_requests]
-            })
-            
-            current_data = pd.concat([current_data, new_row], ignore_index=True)
+            next_timestamp = last_timestamp + pd.Timedelta(minutes=5)
+            new_row = {
+                'timestamp': next_timestamp,
+                'cpu_usage': pred['cpu_usage'],
+                'ram_usage': pred['ram_usage'],
+            }
+            for column in preprocessor.feature_columns:
+                if column not in new_row:
+                    new_row[column] = current_data[column].iloc[-1]
+            current_data = pd.concat([current_data, pd.DataFrame([new_row])], ignore_index=True)
         
         return pd.DataFrame(predictions)
 

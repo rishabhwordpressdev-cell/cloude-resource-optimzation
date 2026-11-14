@@ -1,7 +1,8 @@
 """
 Scenario Generation Module
 ==========================
-Defines various workload scenarios to test the robustness of the AI optimizer.
+Defines synthetic workload perturbations used for stress testing.
+These are simulated scenarios, not additional observations from the source trace.
 """
 
 import pandas as pd
@@ -13,7 +14,7 @@ class WorkloadScenario:
     """
     
     @staticmethod
-    def apply_scenario(data, scenario_name):
+    def apply_scenario(data, scenario_name, random_seed=42):
         """
         Apply a specific workload scenario to the dataset.
         
@@ -29,6 +30,7 @@ class WorkloadScenario:
         pd.DataFrame : Modified dataset
         """
         df = data.copy()
+        np.random.seed(random_seed)
         
         if scenario_name == "Sudden Traffic Spike":
             return WorkloadScenario._sudden_traffic_spike(df)
@@ -54,11 +56,17 @@ class WorkloadScenario:
         # Apply spike (x3 multiplier)
         df.iloc[mid_point:mid_point+duration, df.columns.get_loc('cpu_usage')] *= 3.0
         df.iloc[mid_point:mid_point+duration, df.columns.get_loc('ram_usage')] *= 2.5
-        df.iloc[mid_point:mid_point+duration, df.columns.get_loc('requests')] *= 3.0
+        if 'requests' in df.columns:
+            df.iloc[mid_point:mid_point+duration, df.columns.get_loc('requests')] *= 3.0
+        if 'assigned_mem_usage' in df.columns:
+            df.iloc[mid_point:mid_point+duration, df.columns.get_loc('assigned_mem_usage')] *= 2.5
+            df['assigned_mem_usage'] = df['assigned_mem_usage'].clip(upper=100)
         
         # Clip to max values
         df['cpu_usage'] = df['cpu_usage'].clip(upper=100)
         df['ram_usage'] = df['ram_usage'].clip(upper=100)
+        if 'assigned_mem_usage' in df.columns:
+            df['assigned_mem_usage'] = df['assigned_mem_usage'].clip(upper=100)
         
         return df
 
@@ -71,7 +79,10 @@ class WorkloadScenario:
         # Scale down entire dataset to 20% of original load
         df['cpu_usage'] *= 0.2
         df['ram_usage'] *= 0.25
-        df['requests'] = (df['requests'] * 0.2).astype(int)
+        if 'requests' in df.columns:
+            df['requests'] = (df['requests'] * 0.2).astype(int)
+        if 'assigned_mem_usage' in df.columns:
+            df['assigned_mem_usage'] *= 0.25
         
         return df
 
@@ -89,7 +100,10 @@ class WorkloadScenario:
             # Extreme spike (x4)
             df.iloc[point:point+duration, df.columns.get_loc('cpu_usage')] = 95.0 + np.random.normal(0, 2, duration)
             df.iloc[point:point+duration, df.columns.get_loc('ram_usage')] = 90.0 + np.random.normal(0, 2, duration)
-            df.iloc[point:point+duration, df.columns.get_loc('requests')] *= 5.0
+            if 'requests' in df.columns:
+                df.iloc[point:point+duration, df.columns.get_loc('requests')] *= 5.0
+            if 'assigned_mem_usage' in df.columns:
+                df.iloc[point:point+duration, df.columns.get_loc('assigned_mem_usage')] = 95.0
             
         # Clip
         df['cpu_usage'] = df['cpu_usage'].clip(upper=100)
@@ -109,7 +123,11 @@ class WorkloadScenario:
         
         df['cpu_usage'] *= growth_factor
         df['ram_usage'] *= growth_factor
-        df['requests'] = (df['requests'] * growth_factor).astype(int)
+        if 'requests' in df.columns:
+            df['requests'] = (df['requests'] * growth_factor).astype(int)
+        if 'assigned_mem_usage' in df.columns:
+            df['assigned_mem_usage'] *= growth_factor
+            df['assigned_mem_usage'] = df['assigned_mem_usage'].clip(upper=100)
         
         # Clip
         df['cpu_usage'] = df['cpu_usage'].clip(upper=100)

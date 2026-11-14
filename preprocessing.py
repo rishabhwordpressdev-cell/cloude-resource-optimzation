@@ -30,6 +30,8 @@ class DataPreprocessor:
         self.feature_scaler = None
         self.target_scaler = None
         self.is_fitted = False
+        self.feature_columns = None
+        self.target_columns = None
     
     def load_data(self, file_path):
         """
@@ -116,70 +118,65 @@ class DataPreprocessor:
         
         return np.array(X), np.array(y)
     
-    def prepare_lstm_data(self, df, sequence_length=24, test_size=0.2, 
-                          features=['cpu_usage', 'ram_usage', 'requests'],
-                          targets=['cpu_usage', 'ram_usage']):
-        """
-        Prepare data specifically for LSTM model.
-        
-        Parameters:
-        -----------
-        df : pd.DataFrame
-            Input dataframe
-        sequence_length : int
-            Number of time steps to look back
-        test_size : float
-            Proportion of data for testing
-        features : list
-            Feature columns to use
-        targets : list
-            Target columns to predict
-        
-        Returns:
-        --------
-        tuple : (X_train, X_test, y_train, y_test, scalers)
-        """
-        # Extract features and targets
-        feature_data = df[features].values
-        target_data = df[targets].values
-        
-        # Scale features
+    def prepare_lstm_data(self, df, sequence_length=24, test_size=0.2,
+                          features=None, targets=None):
+        """Prepare chronological LSTM data without fitting scalers on test rows."""
+        if features is None:
+            features = ['cpu_usage', 'ram_usage', 'requests']
+        if targets is None:
+            targets = ['cpu_usage', 'ram_usage']
+
+        missing = [c for c in list(features) + list(targets) if c not in df.columns]
+        if missing:
+            raise ValueError(f"Missing preprocessing columns: {missing}")
+        if not 0 < test_size < 1:
+            raise ValueError("test_size must be between 0 and 1")
+        if len(df) <= sequence_length + 1:
+            raise ValueError("Not enough rows to create LSTM sequences")
+
+        self.feature_columns = list(features)
+        self.target_columns = list(targets)
+        feature_data = df[features].to_numpy(dtype=float)
+        target_data = df[targets].to_numpy(dtype=float)
+
+        # Split by time before fitting scalers to avoid test-set leakage.
+        train_row_end = int(len(df) * (1 - test_size))
+        if train_row_end <= sequence_length:
+            raise ValueError("Training partition is too small for the sequence length")
+
         self.feature_scaler = MinMaxScaler()
-        feature_data_scaled = self.feature_scaler.fit_transform(feature_data)
-        
-        # Scale targets
         self.target_scaler = MinMaxScaler()
-        target_data_scaled = self.target_scaler.fit_transform(target_data)
-        
-        # Create sequences for features (X) - use all features
-        X, _ = self.create_sequences(feature_data_scaled, sequence_length)
-        
-        # Create sequences for targets (y) - use only target columns
-        _, y = self.create_sequences(target_data_scaled, sequence_length)
-        
-        # Reshape y to remove the extra dimension if needed
-        # y shape is (samples, 1, n_targets), we need (samples, n_targets)
-        if len(y.shape) == 3 and y.shape[1] == 1:
-            y = y.reshape(y.shape[0], y.shape[2])
-        
-        # Split into train/test
-        split_idx = int(len(X) * (1 - test_size))
-        X_train, X_test = X[:split_idx], X[split_idx:]
-        y_train, y_test = y[:split_idx], y[split_idx:]
-        
+        self.feature_scaler.fit(feature_data[:train_row_end])
+        self.target_scaler.fit(target_data[:train_row_end])
+        feature_scaled = self.feature_scaler.transform(feature_data)
+        target_scaled = self.target_scaler.transform(target_data)
+
+        X, y = [], []
+        for i in range(len(df) - sequence_length):
+            X.append(feature_scaled[i:i + sequence_length])
+            y.append(target_scaled[i + sequence_length])
+        X = np.asarray(X, dtype=np.float32)
+        y = np.asarray(y, dtype=np.float32)
+
+        # A sample belongs to train only when its target row is before the
+        # chronological split. Test sequences may use preceding history.
+        target_rows = np.arange(sequence_length, len(df))
+        train_mask = target_rows < train_row_end
+        test_mask = ~train_mask
+        X_train, X_test = X[train_mask], X[test_mask]
+        y_train, y_test = y[train_mask], y[test_mask]
         self.is_fitted = True
-        
-        print(f"✅ Prepared LSTM data:")
+
+        print("Prepared LSTM data (chronological split; scalers fitted on training rows):")
         print(f"   - Training samples: {len(X_train)}")
         print(f"   - Testing samples: {len(X_test)}")
         print(f"   - Sequence length: {sequence_length}")
         print(f"   - Features: {features}")
         print(f"   - Targets: {targets}")
-        
         return X_train, X_test, y_train, y_test
-    
+
     def prepare_rf_data(self, df, test_size=0.2, lookback=24,
-                       features=['cpu_usage', 'ram_usage', 'requests'],
+                       features=['cpu_usage', 'ram_usage', 'assigned_mem_usage'],
                        targets=['cpu_usage', 'ram_usage']):
         """
         Prepare data for Random Forest model (with lag features).
@@ -202,6 +199,8 @@ class DataPreprocessor:
         tuple : (X_train, X_test, y_train, y_test, scaler)
         """
         # Create lag features
+        self.feature_columns = list(features)
+        self.target_columns = list(targets)
         df_processed = df.copy()
         
         for col in features:

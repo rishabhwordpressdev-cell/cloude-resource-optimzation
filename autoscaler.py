@@ -1,220 +1,101 @@
-"""
-Auto-Scaling Decision Module
-=============================
-Makes scaling decisions (SCALE UP / SCALE DOWN / NO ACTION) based on predictions.
-"""
+"""Auto-scaling decisions — V4.
 
-import numpy as np
+Instance count is a separate infrastructure dimension. CPU and RAM quantities
+remain elastic pooled allocations and are not multiplied by instance count.
+"""
+import math
 
 
 class AutoScaler:
-    """
-    Auto-scaling decision engine based on predicted resource demand.
-    """
-    
-    def __init__(self,
-                 scale_up_threshold=0.75,    # Scale up if utilization > 75%
-                 scale_down_threshold=0.40, # Scale down if utilization < 40%
-                 min_instances=1,            # Minimum number of instances
-                 max_instances=10,           # Maximum number of instances
-                 scale_factor=1.5):         # Scaling factor (multiply by this)
-        """
-        Initialize auto-scaler.
-        
-        Parameters:
-        -----------
-        scale_up_threshold : float
-            Utilization threshold to trigger scale up (0.0 to 1.0)
-        scale_down_threshold : float
-            Utilization threshold to trigger scale down (0.0 to 1.0)
-        min_instances : int
-            Minimum number of instances
-        max_instances : int
-            Maximum number of instances
-        scale_factor : float
-            Factor to scale by (e.g., 1.5 = 50% increase)
-        """
-        self.scale_up_threshold = scale_up_threshold
-        self.scale_down_threshold = scale_down_threshold
-        self.min_instances = min_instances
-        self.max_instances = max_instances
-        self.scale_factor = scale_factor
-    
-    def decide_scaling_action(self, predicted_cpu, predicted_ram, 
-                            current_cpu_allocation, current_ram_allocation,
-                            current_instances=1):
-        """
-        Decide scaling action based on predictions.
-        
-        Parameters:
-        -----------
-        predicted_cpu : float
-            Predicted CPU usage percentage
-        predicted_ram : float
-            Predicted RAM usage percentage
-        current_cpu_allocation : float
-            Current CPU allocation per instance
-        current_ram_allocation : float
-            Current RAM allocation per instance
-        current_instances : int
-            Current number of instances
-        
-        Returns:
-        --------
-        dict : Scaling decision with keys:
-            - action: 'SCALE_UP', 'SCALE_DOWN', or 'NO_ACTION'
-            - new_instances: New number of instances
-            - reason: Explanation of decision
-            - cpu_utilization: Current CPU utilization
-            - ram_utilization: Current RAM utilization
-        """
-        # Calculate current utilization
-        total_cpu_capacity = current_cpu_allocation * current_instances
-        total_ram_capacity = current_ram_allocation * current_instances
-        
-        cpu_utilization = predicted_cpu / total_cpu_capacity if total_cpu_capacity > 0 else 0
-        ram_utilization = predicted_ram / total_ram_capacity if total_ram_capacity > 0 else 0
-        
-        # Use maximum of CPU and RAM utilization for decision
-        max_utilization = max(cpu_utilization, ram_utilization)
-        
-        # Clamp utilization to 0-1
-        cpu_utilization = min(1.0, max(0.0, cpu_utilization))
-        ram_utilization = min(1.0, max(0.0, ram_utilization))
-        max_utilization = min(1.0, max(0.0, max_utilization))
-        
-        # Decision logic
-        action = 'NO_ACTION'
-        new_instances = current_instances
-        reason = ""
-        
-        if max_utilization > self.scale_up_threshold:
-            # Scale up
-            action = 'SCALE_UP'
-            new_instances = min(self.max_instances, 
-                              int(np.ceil(current_instances * self.scale_factor)))
-            reason = f"High utilization ({max_utilization*100:.1f}%) detected. Scaling up to handle increased load."
-        
-        elif max_utilization < self.scale_down_threshold and current_instances > self.min_instances:
-            # Scale down
-            action = 'SCALE_DOWN'
-            new_instances = max(self.min_instances, 
-                              int(np.floor(current_instances / self.scale_factor)))
-            reason = f"Low utilization ({max_utilization*100:.1f}%) detected. Scaling down to reduce costs."
-        
+    def __init__(self, scale_up_threshold=0.75, scale_down_threshold=0.40,
+                 min_instances=1, max_instances=10, scale_factor=1.5,
+                 cpu_capacity_per_instance=100.0, ram_capacity_per_instance=100.0,
+                 scale_up_cooldown=1, scale_down_cooldown=3):
+        if not 0 <= scale_down_threshold < scale_up_threshold <= 1:
+            raise ValueError('Thresholds must satisfy 0 <= scale-down < scale-up <= 1.')
+        self.scale_up_threshold = float(scale_up_threshold)
+        self.scale_down_threshold = float(scale_down_threshold)
+        self.min_instances = int(min_instances)
+        self.max_instances = int(max_instances)
+        self.scale_factor = float(scale_factor)
+        self.cpu_capacity_per_instance = float(cpu_capacity_per_instance)
+        self.ram_capacity_per_instance = float(ram_capacity_per_instance)
+        self.scale_up_cooldown = max(0, int(scale_up_cooldown))
+        self.scale_down_cooldown = max(0, int(scale_down_cooldown))
+        self.reset()
+
+    def reset(self):
+        self._steps_since_scale = max(self.scale_up_cooldown, self.scale_down_cooldown)
+
+    def plan_instance_count(self, allocated_cpu, allocated_ram, current_instances=1):
+        """Size instance fleet to elastic resource footprint; count stays separate."""
+        current = max(self.min_instances, min(self.max_instances, int(current_instances)))
+        cpu_nodes = math.ceil(max(0.0, float(allocated_cpu)) / self.cpu_capacity_per_instance)
+        ram_nodes = math.ceil(max(0.0, float(allocated_ram)) / self.ram_capacity_per_instance)
+        required = max(self.min_instances, cpu_nodes, ram_nodes)
+        required = min(self.max_instances, required)
+        if required > current:
+            if self._steps_since_scale >= self.scale_up_cooldown:
+                new_count, action = required, 'SCALE_UP'
+            else:
+                new_count, action = current, 'COOLDOWN'
+        elif required < current:
+            if self._steps_since_scale >= self.scale_down_cooldown:
+                new_count, action = required, 'SCALE_DOWN'
+            else:
+                new_count, action = current, 'COOLDOWN'
         else:
-            # No action needed
-            action = 'NO_ACTION'
-            new_instances = current_instances
-            reason = f"Utilization ({max_utilization*100:.1f}%) is within acceptable range. No scaling needed."
-        
+            new_count, action = current, 'NO_ACTION'
+        if new_count != current:
+            self._steps_since_scale = 0
+        else:
+            self._steps_since_scale += 1
         return {
-            'action': action,
-            'new_instances': new_instances,
-            'current_instances': current_instances,
-            'reason': reason,
-            'cpu_utilization': cpu_utilization,
-            'ram_utilization': ram_utilization,
-            'max_utilization': max_utilization,
-            'predicted_cpu': predicted_cpu,
-            'predicted_ram': predicted_ram
+            'action': action, 'current_instances': current,
+            'new_instances': new_count, 'required_instances': required,
+            'cpu_capacity_per_instance': self.cpu_capacity_per_instance,
+            'ram_capacity_per_instance': self.ram_capacity_per_instance,
+            'reason': f'Elastic allocation requires {required} instance(s); fleet is {new_count}.'
         }
-    
-    def calculate_resource_allocation(self, total_cpu_needed, total_ram_needed, 
-                                     num_instances, cpu_per_instance=None, 
-                                     ram_per_instance=None):
-        """
-        Calculate resource allocation per instance.
-        
-        Parameters:
-        -----------
-        total_cpu_needed : float
-            Total CPU needed
-        total_ram_needed : float
-            Total RAM needed
-        num_instances : int
-            Number of instances
-        cpu_per_instance : float, optional
-            Fixed CPU per instance (if None, calculated)
-        ram_per_instance : float, optional
-            Fixed RAM per instance (if None, calculated)
-        
-        Returns:
-        --------
-        dict : Allocation details
-        """
-        if cpu_per_instance is None:
-            cpu_per_instance = total_cpu_needed / num_instances if num_instances > 0 else 0
-        
-        if ram_per_instance is None:
-            ram_per_instance = total_ram_needed / num_instances if num_instances > 0 else 0
-        
+
+    def decide_scaling_action(self, predicted_cpu, predicted_ram,
+                              current_cpu_allocation, current_ram_allocation,
+                              current_instances=1):
+        """Legacy threshold-based decision API retained for V3 compatibility."""
+        total_cpu = max(0.0, current_cpu_allocation * current_instances)
+        total_ram = max(0.0, current_ram_allocation * current_instances)
+        cpu_util = float(predicted_cpu) / total_cpu if total_cpu else 0.0
+        ram_util = float(predicted_ram) / total_ram if total_ram else 0.0
+        peak = max(cpu_util, ram_util)
+        new_count = int(current_instances)
+        action = 'NO_ACTION'
+        if peak > self.scale_up_threshold:
+            new_count = min(self.max_instances, max(new_count + 1, math.ceil(new_count * self.scale_factor)))
+            action = 'SCALE_UP' if new_count != current_instances else 'AT_MAXIMUM'
+        elif peak < self.scale_down_threshold and new_count > self.min_instances:
+            new_count = max(self.min_instances, min(new_count - 1, math.floor(new_count / self.scale_factor)))
+            action = 'SCALE_DOWN'
         return {
-            'cpu_per_instance': cpu_per_instance,
-            'ram_per_instance': ram_per_instance,
-            'total_cpu': cpu_per_instance * num_instances,
-            'total_ram': ram_per_instance * num_instances,
-            'num_instances': num_instances
+            'action': action, 'new_instances': new_count,
+            'current_instances': int(current_instances),
+            'reason': f'Peak utilization {peak:.3f}; action {action}.',
+            'cpu_utilization': min(1.0, max(0.0, cpu_util)),
+            'ram_utilization': min(1.0, max(0.0, ram_util)),
+            'max_utilization': min(1.0, max(0.0, peak)),
+            'predicted_cpu': predicted_cpu, 'predicted_ram': predicted_ram,
         }
 
-
-if __name__ == "__main__":
-    # Test auto-scaler
-    print("🔄 Testing auto-scaler...")
-    
-    autoscaler = AutoScaler(
-        scale_up_threshold=0.75,
-        scale_down_threshold=0.40,
-        min_instances=1,
-        max_instances=10
-    )
-    
-    # Test scenarios
-    scenarios = [
-        {
-            'name': 'High Load',
-            'predicted_cpu': 85,
-            'predicted_ram': 80,
-            'current_cpu': 50,
-            'current_ram': 50,
-            'instances': 2
-        },
-        {
-            'name': 'Low Load',
-            'predicted_cpu': 25,
-            'predicted_ram': 30,
-            'current_cpu': 50,
-            'current_ram': 50,
-            'instances': 3
-        },
-        {
-            'name': 'Normal Load',
-            'predicted_cpu': 55,
-            'predicted_ram': 50,
-            'current_cpu': 50,
-            'current_ram': 50,
-            'instances': 2
-        }
-    ]
-    
-    for scenario in scenarios:
-        decision = autoscaler.decide_scaling_action(
-            predicted_cpu=scenario['predicted_cpu'],
-            predicted_ram=scenario['predicted_ram'],
-            current_cpu_allocation=scenario['current_cpu'],
-            current_ram_allocation=scenario['current_ram'],
-            current_instances=scenario['instances']
-        )
-        
-        print(f"\n📊 Scenario: {scenario['name']}")
-        print(f"   Action: {decision['action']}")
-        print(f"   Instances: {decision['current_instances']} → {decision['new_instances']}")
-        print(f"   CPU Utilization: {decision['cpu_utilization']*100:.1f}%")
-        print(f"   RAM Utilization: {decision['ram_utilization']*100:.1f}%")
-        print(f"   Reason: {decision['reason']}")
-    
-    print("\n✅ Auto-scaler test completed!")
+    def calculate_resource_allocation(self, total_cpu_needed, total_ram_needed,
+                                      num_instances, cpu_per_instance=None,
+                                      ram_per_instance=None):
+        count = max(1, int(num_instances))
+        cpu_each = total_cpu_needed / count if cpu_per_instance is None else cpu_per_instance
+        ram_each = total_ram_needed / count if ram_per_instance is None else ram_per_instance
+        return {'cpu_per_instance': cpu_each, 'ram_per_instance': ram_each,
+                'total_cpu': cpu_each * count, 'total_ram': ram_each * count,
+                'num_instances': count}
 
 
-
-
+if __name__ == '__main__':
+    scaler = AutoScaler()
+    print(scaler.plan_instance_count(165, 72, current_instances=1))

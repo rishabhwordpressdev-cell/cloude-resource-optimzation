@@ -36,7 +36,7 @@ class CloudSimulator:
     def simulate_baseline(self, data, fixed_cpu=100, fixed_ram=100, sla_threshold=0.9):
         """
         Simulate baseline scenario (fixed allocation, no AI optimization).
-         SLA Violation = CPU Usage > SLA Threshold
+         SLA Violation = CPU or RAM utilization > SLA Threshold
         """
         results = {
             'cpu_utilizations': [],
@@ -60,7 +60,7 @@ class CloudSimulator:
             ram_util = min(1.0, max(0.0, ram_util))
             
             # Track SLA violation
-            if cpu_util > sla_threshold:
+            if cpu_util > sla_threshold or ram_util > sla_threshold:
                 results['sla_violations'] += 1
             
             # Calculate wasted resources
@@ -69,7 +69,7 @@ class CloudSimulator:
             
             # Calculate cost
             # Baseline assumes 1 big fixed instance or multiple fixed instances summing to fixed_cpu
-            instance_count = max(1, int(fixed_cpu / 60.0)) # Estimating instances based on new base unit
+            instance_count = 1  # One fixed-capacity baseline instance in this comparison
             
             cost = self.optimizer.calculate_cost(
                 allocated_cpu=fixed_cpu,
@@ -98,7 +98,7 @@ class CloudSimulator:
         results['avg_wasted_ram'] = np.mean(results['wasted_ram'])
         results['total_cost'] = np.sum(results['costs'])
         results['avg_efficiency'] = np.mean(results['efficiency_scores'])
-        results['sla_violation_rate'] = (results['sla_violations'] / len(data)) * 100
+        results['sla_violation_rate'] = (results['sla_violations'] / max(len(results['cpu_utilizations']), 1)) * 100
         
         return results
     
@@ -123,8 +123,8 @@ class CloudSimulator:
             
         # Start with 1 instance
         current_instances = 1
-        base_cpu_unit = 60.0
-        base_ram_unit = 60.0
+        base_cpu_unit = 100.0
+        base_ram_unit = 100.0
         
         for _, row in data.iterrows():
             # Get current demand
@@ -176,7 +176,7 @@ class CloudSimulator:
             efficiency = (avg_util * 0.7 + cost_eff * 0.3)
             
             # Track SLA violation
-            if final_util_cpu > sla_threshold:
+            if final_util_cpu > sla_threshold or final_util_ram > sla_threshold:
                 results['sla_violations'] += 1
                 
             results['cpu_utilizations'].append(final_util_cpu)
@@ -198,150 +198,129 @@ class CloudSimulator:
         results['avg_wasted_ram'] = np.mean(results['wasted_ram'])
         results['total_cost'] = np.sum(results['costs'])
         results['avg_efficiency'] = np.mean(results['efficiency_scores'])
-        results['sla_violation_rate'] = (results['sla_violations'] / len(data)) * 100
+        results['sla_violation_rate'] = (results['sla_violations'] / max(len(results['cpu_utilizations']), 1)) * 100
         
         return results
     
-    def simulate_ai_optimized(self, data, predictor, preprocessor, 
-                            lookback_window=24, decision_logger=None, sla_threshold=0.9):
-        """
-        Simulate AI-optimized scenario (dynamic allocation based on predictions).
+    def simulate_ai_optimized(self, data, predictor, preprocessor,
+                              lookback_window=24, decision_logger=None, sla_threshold=0.9):
+        """Predict demand, allocate CPU/RAM elastically, and size instance count separately.
+
+        Per interval, the optimizer requests pooled elastic CPU/RAM allocations.
+        The autoscaler independently sizes the instance fleet. Effective
+        provisioned allocations are capped by the fleet capacity, so cooldowns
+        and maximum-instance limits cannot create unprovisioned resources.
         """
         results = {
-            'cpu_utilizations': [],
-            'ram_utilizations': [],
-            'wasted_cpu': [],
-            'wasted_ram': [],
-            'costs': [],
-            'efficiency_scores': [],
-            'allocations': [],
-            'sla_violations': 0
+            'cpu_utilizations': [], 'ram_utilizations': [],
+            'wasted_cpu': [], 'wasted_ram': [], 'costs': [],
+            'efficiency_scores': [], 'allocations': [],
+            'sla_violations': 0, 'prediction_failures': 0,
+            'scale_up_events': 0, 'scale_down_events': 0,
+            'capacity_shortfall_steps': 0, 'requested_cpu': [], 'requested_ram': [],
         }
-        
-        # Track current instance count for autoscaling
-        current_instances = 1
-        current_cpu_per_instance = 100.0
-        current_ram_per_instance = 100.0
-        
-        # Start from lookback_window to have enough history
+        current_instances = self.autoscaler.min_instances
+        self.autoscaler.reset()
+
         for i in range(lookback_window, len(data)):
-            # Get recent history
             recent_data = data.iloc[i-lookback_window:i]
-            
+            actual_cpu = float(data.iloc[i]['cpu_usage'])
+            actual_ram = float(data.iloc[i]['ram_usage'])
+            prediction_ok = True
             try:
-                # Predict next step
                 prediction = predictor.predict_next_step(recent_data, preprocessor)
-                
-                # Make scaling decision using autoscaler
-                scaling_decision = self.autoscaler.decide_scaling_action(
-                    predicted_cpu=prediction['cpu_usage'],
-                    predicted_ram=prediction['ram_usage'],
-                    current_cpu_allocation=current_cpu_per_instance,
-                    current_ram_allocation=current_ram_per_instance,
-                    current_instances=current_instances
-                )
-                
-                # Update instance count based on decision
-                current_instances = scaling_decision['new_instances']
-                
-                # Log decision if logger provided
-                if decision_logger is not None:
-                    timestamp = data.iloc[i]['timestamp'] if 'timestamp' in data.columns else None
-                    decision_logger.log_decision(
-                        step=i - lookback_window + 1,  # Step number starting from 1
-                        predicted_cpu=prediction['cpu_usage'],
-                        predicted_ram=prediction['ram_usage'],
-                        sla_threshold=self.autoscaler.scale_up_threshold,
-                        decision_dict=scaling_decision,
-                        timestamp=timestamp
-                    )
-                
-                # Optimize allocation based on predicted demand
-                optimization = self.optimizer.optimize_allocation(
-                    predicted_cpu=prediction['cpu_usage'],
-                    predicted_ram=prediction['ram_usage']
-                )
-                
-                # Adjust allocation per instance based on scaling
-                if current_instances > 0:
-                    current_cpu_per_instance = optimization['optimal_cpu'] / current_instances
-                    current_ram_per_instance = optimization['optimal_ram'] / current_instances
-                
-                # Get actual usage
-                actual_cpu = data.iloc[i]['cpu_usage']
-                actual_ram = data.iloc[i]['ram_usage']
-                
-                # Calculate utilization with optimized allocation
-                cpu_util = actual_cpu / optimization['optimal_cpu'] if optimization['optimal_cpu'] > 0 else 0
-                ram_util = actual_ram / optimization['optimal_ram'] if optimization['optimal_ram'] > 0 else 0
-                
-                cpu_util = min(1.0, max(0.0, cpu_util))
-                ram_util = min(1.0, max(0.0, ram_util))
-                
-                # Calculate wasted resources
-                wasted_cpu = max(0, optimization['optimal_cpu'] - actual_cpu)
-                wasted_ram = max(0, optimization['optimal_ram'] - actual_ram)
-                
-                # Track SLA violation
-                if cpu_util > sla_threshold:
-                    results['sla_violations'] += 1
-                
-                results['cpu_utilizations'].append(cpu_util)
-                results['ram_utilizations'].append(ram_util)
-                results['wasted_cpu'].append(wasted_cpu)
-                results['wasted_ram'].append(wasted_ram)
-                # Calculate real cost (using actual usage for idle penalty)
-                real_cost = self.optimizer.calculate_cost(
-                    allocated_cpu=optimization['optimal_cpu'],
-                    allocated_ram=optimization['optimal_ram'],
-                    used_cpu=actual_cpu,
-                    used_ram=actual_ram,
-                    instance_count=current_instances if current_instances > 0 else 1
-                )
-                
-                results['costs'].append(real_cost)
-                results['efficiency_scores'].append(optimization['efficiency_score'])
-                results['allocations'].append({
-                    'cpu': optimization['optimal_cpu'],
-                    'ram': optimization['optimal_ram']
-                })
-            
-            except Exception as e:
-                # If prediction fails, use baseline
-                print(f"⚠️  Prediction failed at step {i}: {e}")
-                # Use simple heuristic
-                actual_cpu = data.iloc[i]['cpu_usage']
-                actual_ram = data.iloc[i]['ram_usage']
-                optimization = self.optimizer.optimize_allocation(
-                    predicted_cpu=actual_cpu,
-                    predicted_ram=actual_ram
-                )
-                
-                cpu_util = (actual_cpu / 100.0) / optimization['optimal_cpu'] if optimization['optimal_cpu'] > 0 else 0
-                ram_util = (actual_ram / 100.0) / optimization['optimal_ram'] if optimization['optimal_ram'] > 0 else 0
-                
-                results['cpu_utilizations'].append(min(1.0, max(0.0, cpu_util)))
-                results['ram_utilizations'].append(min(1.0, max(0.0, ram_util)))
-                results['wasted_cpu'].append(max(0, optimization['optimal_cpu'] - actual_cpu/100.0))
-                results['wasted_ram'].append(max(0, optimization['optimal_ram'] - actual_ram/100.0))
-                results['costs'].append(optimization['cost'])
-                results['efficiency_scores'].append(optimization['efficiency_score'])
-                results['allocations'].append({
-                    'cpu': optimization['optimal_cpu'],
-                    'ram': optimization['optimal_ram']
-                })
-        
-        # Calculate summary statistics
-        results['avg_cpu_utilization'] = np.mean(results['cpu_utilizations'])
-        results['avg_ram_utilization'] = np.mean(results['ram_utilizations'])
-        results['avg_wasted_cpu'] = np.mean(results['wasted_cpu'])
-        results['avg_wasted_ram'] = np.mean(results['wasted_ram'])
-        results['total_cost'] = np.sum(results['costs'])
-        results['avg_efficiency'] = np.mean(results['efficiency_scores'])
-        results['sla_violation_rate'] = (results['sla_violations'] / len(data)) * 100
-        
+                predicted_cpu = float(prediction['cpu_usage'])
+                predicted_ram = float(prediction['ram_usage'])
+            except Exception as exc:
+                prediction_ok = False
+                results['prediction_failures'] += 1
+                print(f'Prediction fallback at evaluation row {i}: {exc}')
+                # Explicit persistence fallback: last observed workload values.
+                predicted_cpu = float(recent_data.iloc[-1]['cpu_usage'])
+                predicted_ram = float(recent_data.iloc[-1]['ram_usage'])
+
+            allocation = self.optimizer.allocate_elastic_resources(predicted_cpu, predicted_ram)
+            scaling = self.autoscaler.plan_instance_count(
+                allocation['allocated_cpu'], allocation['allocated_ram'], current_instances)
+            current_instances = scaling['new_instances']
+            if scaling['action'] == 'SCALE_UP':
+                results['scale_up_events'] += 1
+            elif scaling['action'] == 'SCALE_DOWN':
+                results['scale_down_events'] += 1
+
+            requested_cpu = allocation['allocated_cpu']
+            requested_ram = allocation['allocated_ram']
+            # The fleet is a hard capacity constraint. Elastic allocations can
+            # use less than fleet capacity, but can never exceed it. During a
+            # cooldown (or at max_instances), unmet allocation remains visible
+            # as higher utilization/SLA risk rather than fictitious capacity.
+            fleet_cpu_capacity = (current_instances * self.autoscaler.cpu_capacity_per_instance)
+            fleet_ram_capacity = (current_instances * self.autoscaler.ram_capacity_per_instance)
+            allocated_cpu = min(requested_cpu, fleet_cpu_capacity)
+            allocated_ram = min(requested_ram, fleet_ram_capacity)
+            results['requested_cpu'].append(requested_cpu)
+            results['requested_ram'].append(requested_ram)
+            if actual_cpu > allocated_cpu or actual_ram > allocated_ram:
+                results['capacity_shortfall_steps'] += 1
+
+            cpu_util = actual_cpu / allocated_cpu if allocated_cpu > 0 else float('inf')
+            ram_util = actual_ram / allocated_ram if allocated_ram > 0 else float('inf')
+            # Keep raw utilization for SLA detection; cap only displayed values.
+            if cpu_util > sla_threshold or ram_util > sla_threshold:
+                results['sla_violations'] += 1
+            cpu_util_display = min(1.0, max(0.0, cpu_util))
+            ram_util_display = min(1.0, max(0.0, ram_util))
+
+            # Cost only the resources actually provisioned, plus the independent
+            # instance base charge. Do not bill the unfulfilled request.
+            cost = self.optimizer.calculate_cost(
+                allocated_cpu, allocated_ram, actual_cpu, actual_ram,
+                instance_count=current_instances)
+            avg_util = (cpu_util_display + ram_util_display) / 2.0
+            cost_eff = 1.0 / (1.0 + cost / 100.0)
+            efficiency = avg_util * 0.7 + cost_eff * 0.3
+
+            results['cpu_utilizations'].append(cpu_util_display)
+            results['ram_utilizations'].append(ram_util_display)
+            results['wasted_cpu'].append(max(0.0, allocated_cpu - actual_cpu))
+            results['wasted_ram'].append(max(0.0, allocated_ram - actual_ram))
+            results['costs'].append(cost)
+            results['efficiency_scores'].append(efficiency)
+            results['allocations'].append({
+                'cpu': allocated_cpu, 'ram': allocated_ram,
+                'requested_cpu': requested_cpu, 'requested_ram': requested_ram,
+                'fleet_cpu_capacity': fleet_cpu_capacity,
+                'fleet_ram_capacity': fleet_ram_capacity,
+                'instances': current_instances,
+                'predicted_cpu': predicted_cpu, 'predicted_ram': predicted_ram,
+                'actual_cpu': actual_cpu, 'actual_ram': actual_ram,
+                'prediction_ok': prediction_ok, 'scaling_action': scaling['action'],
+            })
+
+            if decision_logger is not None:
+                timestamp = data.iloc[i]['timestamp'] if 'timestamp' in data.columns else None
+                decision_logger.log_decision(
+                    step=i - lookback_window + 1,
+                    predicted_cpu=predicted_cpu, predicted_ram=predicted_ram,
+                    sla_threshold=sla_threshold,
+                    decision_dict={**scaling, 'reason': scaling['reason']},
+                    timestamp=timestamp)
+
+        n = max(1, len(results['cpu_utilizations']))
+        results['avg_cpu_utilization'] = float(np.mean(results['cpu_utilizations']))
+        results['avg_ram_utilization'] = float(np.mean(results['ram_utilizations']))
+        results['avg_wasted_cpu'] = float(np.mean(results['wasted_cpu']))
+        results['avg_wasted_ram'] = float(np.mean(results['wasted_ram']))
+        results['total_cost'] = float(np.sum(results['costs']))
+        results['avg_efficiency'] = float(np.mean(results['efficiency_scores']))
+        results['sla_violation_rate'] = results['sla_violations'] / n * 100.0
+        results['avg_instance_count'] = float(np.mean([a['instances'] for a in results['allocations']])) if results['allocations'] else 0.0
+        results['max_instance_count'] = max([a['instances'] for a in results['allocations']], default=0)
+        results['capacity_shortfall_rate'] = results['capacity_shortfall_steps'] / n * 100.0
+        results['avg_requested_cpu'] = float(np.mean(results['requested_cpu'])) if results['requested_cpu'] else 0.0
+        results['avg_requested_ram'] = float(np.mean(results['requested_ram'])) if results['requested_ram'] else 0.0
         return results
-    
+
     def compare_strategies(self, baseline_results, ai_results):
         """
         Compare baseline and AI-optimized strategies.

@@ -11,6 +11,7 @@ warnings.filterwarnings('ignore')
 
 # Import all modules
 from data_simulation import generate_synthetic_cloud_data
+from dataset_adapter import load_google_cluster_dataset
 from preprocessing import DataPreprocessor
 from model_training import LSTMModel, RandomForestModel
 from prediction import WorkloadPredictor
@@ -29,33 +30,28 @@ def main():
     Main function to run the complete pipeline.
     """
     print("\n" + "="*70)
-    print("AI-POWERED CLOUD RESOURCE OPTIMIZATION FRAMEWORK")
+    print("AI-POWERED CLOUD RESOURCE OPTIMIZATION FRAMEWORK — V5")
     print("="*70 + "\n")
     
     # Configuration
-    DATA_FILE = "data/simulated_cloud_data.csv"
+    DATA_FILE = "data/google_cluster_usage.csv"
+    FEATURE_COLUMNS = ["cpu_usage", "ram_usage", "assigned_mem_usage"]
+    TARGET_COLUMNS = ["cpu_usage", "ram_usage"]
     MODEL_TYPE = "lstm"  # Options: 'lstm' or 'rf'
     SEQUENCE_LENGTH = 24
     EPOCHS = 30  # Reduced for faster execution
     BATCH_SIZE = 32
     
-    # Step 1: Generate synthetic data (if not exists)
-    print("📊 STEP 1: Data Generation")
+    # Step 1: Load the public Google Cluster aggregate workload dataset
+    print("📊 STEP 1: Dataset Loading")
     print("-"*70)
     if not os.path.exists(DATA_FILE):
-        print("🔄 Generating synthetic cloud resource data...")
-        df = generate_synthetic_cloud_data(
-            num_days=30,
-            samples_per_hour=4,
-            output_path=DATA_FILE
+        raise FileNotFoundError(
+            f"Dataset not found: {DATA_FILE}. Download it before running the pipeline."
         )
-    else:
-        print(f"✅ Data file already exists: {DATA_FILE}")
-        df = pd.read_csv(DATA_FILE)
-        df['timestamp'] = pd.to_datetime(df['timestamp'])
-        print(f"   Loaded {len(df)} records")
+    df = load_google_cluster_dataset(DATA_FILE)
     print()
-    
+
     # Step 2: Preprocess data
     print("🔧 STEP 2: Data Preprocessing")
     print("-"*70)
@@ -64,7 +60,8 @@ def main():
     
     if MODEL_TYPE == 'lstm':
         X_train, X_test, y_train, y_test = preprocessor.prepare_lstm_data(
-            df, sequence_length=SEQUENCE_LENGTH
+            df, sequence_length=SEQUENCE_LENGTH,
+            features=FEATURE_COLUMNS, targets=TARGET_COLUMNS
         )
     else:
         X_train, X_test, y_train, y_test = preprocessor.prepare_rf_data(
@@ -82,7 +79,10 @@ def main():
     # Step 3: Train model
     print("🤖 STEP 3: Model Training")
     print("-"*70)
-    model_path = f"models/{MODEL_TYPE}_model.h5" if MODEL_TYPE == 'lstm' else f"models/{MODEL_TYPE}_model.pkl"
+    model_path = (
+        f"models/google_cluster_{MODEL_TYPE}_model.h5"
+        if MODEL_TYPE == 'lstm' else f"models/google_cluster_{MODEL_TYPE}_model.pkl"
+    )
     
     if MODEL_TYPE == 'lstm':
         if os.path.exists(model_path):
@@ -155,8 +155,10 @@ def main():
         "Gradual Growth"
     ]
     
-    # Use test data for simulation (last portion of dataset)
-    base_test_data = df.tail(500).copy()  # Last 500 time steps
+    # Fixed held-out workload window. AI uses the first 24 rows as warm-up;
+    # every strategy is scored on the same remaining rows.
+    np.random.seed(42)
+    base_test_data = df.tail(500).copy()
     
     scenario_results_summary = []
     
@@ -175,26 +177,41 @@ def main():
         else:
             test_data = WorkloadScenario.apply_scenario(base_test_data, scenario_name)
         
+        evaluation_data = test_data.iloc[SEQUENCE_LENGTH:].copy()
+        if evaluation_data.empty:
+            raise ValueError("Scenario data is too short after AI warm-up.")
+
         print("   Running Fixed Allocation Strategy...")
         baseline_results = simulator.simulate_baseline(
-            test_data, fixed_cpu=100, fixed_ram=100
-        )
-        
-        print("   Running Threshold-Based Scaler...")
-        threshold_results = simulator.simulate_threshold_scaling(
-            test_data
+            evaluation_data, fixed_cpu=100, fixed_ram=100
         )
 
+        print("   Running Threshold-Based Scaler...")
+        threshold_results = simulator.simulate_threshold_scaling(evaluation_data)
+
         print("   Running AI-Optimized Strategy...")
-        # Clear previous decision logs in memory to avoid congestion if needed, 
-        # or just append to same file with new timestamps
-        
         ai_results = simulator.simulate_ai_optimized(
-            test_data, predictor, preprocessor, 
+            test_data, predictor, preprocessor,
             lookback_window=SEQUENCE_LENGTH,
             decision_logger=decision_logger
         )
-        
+
+        # Save plots for every scenario instead of silently overwriting one
+        # set of plots with the final scenario only.
+        scenario_slug = (scenario_name.lower().replace(' ', '_')
+                         .replace('(', '').replace(')', ''))
+        scenario_plot_dir = os.path.join('outputs', 'scenarios', scenario_slug)
+        os.makedirs(scenario_plot_dir, exist_ok=True)
+        visualizer.plot_utilization_comparison(
+            baseline_results, ai_results, threshold_results,
+            save_path=os.path.join(scenario_plot_dir, 'utilization_comparison.png'))
+        visualizer.plot_cost_efficiency(
+            baseline_results, ai_results, threshold_results,
+            save_path=os.path.join(scenario_plot_dir, 'cost_efficiency.png'))
+        visualizer.plot_time_series_utilization(
+            baseline_results, ai_results, threshold_results,
+            save_path=os.path.join(scenario_plot_dir, 'time_series_utilization.png'))
+
         comparison = simulator.compare_strategies(baseline_results, ai_results)
         
         # Store for summary
@@ -205,7 +222,24 @@ def main():
             "AI Cost": ai_results['total_cost'],
             "Cost Saving (%)": comparison['cost_reduction'],
             "AI Efficiency": ai_results['avg_efficiency'],
-            "Imp. (%)": comparison['efficiency_improvement']
+            "AI Avg Instances": ai_results.get('avg_instance_count', 0.0),
+            "AI Max Instances": ai_results.get('max_instance_count', 0),
+            "AI Prediction Failures": ai_results.get('prediction_failures', 0),
+            "AI Capacity Shortfall Rate": ai_results.get('capacity_shortfall_rate', 0.0),
+            "AI Scale Ups": ai_results.get('scale_up_events', 0),
+            "AI Scale Downs": ai_results.get('scale_down_events', 0),
+            "Imp. (%)": comparison['efficiency_improvement'],
+            "Baseline CPU": baseline_results['avg_cpu_utilization'],
+            "Threshold CPU": threshold_results['avg_cpu_utilization'],
+            "AI CPU": ai_results['avg_cpu_utilization'],
+            "Baseline RAM": baseline_results['avg_ram_utilization'],
+            "Threshold RAM": threshold_results['avg_ram_utilization'],
+            "AI RAM": ai_results['avg_ram_utilization'],
+            "Baseline SLA": baseline_results['sla_violation_rate'],
+            "Threshold SLA": threshold_results['sla_violation_rate'],
+            "AI SLA": ai_results['sla_violation_rate'],
+            "Baseline Efficiency": baseline_results['avg_efficiency'],
+            "Threshold Efficiency": threshold_results['avg_efficiency']
         }
         scenario_results_summary.append(summary_entry)
         print(f"   ✅ Scenario '{scenario_name}' completed.")
@@ -248,6 +282,13 @@ def main():
         line = f"{res['Scenario']:<25} | {base_cost_str:<12} | {thr_cost_str:<12} | {ai_cost_str:<12} | {res['Cost Saving (%)']:<12.2f} | {res['AI Efficiency']:<10.4f} | {res['Imp. (%)']:<12.2f}"
         print(line)
         report_lines.append(line)
+        diagnostics = (f"    AI fleet: avg={res.get('AI Avg Instances', 0):.2f}, "
+                       f"max={res.get('AI Max Instances', 0)}, "
+                       f"scale-ups={res.get('AI Scale Ups', 0)}, "
+                       f"scale-downs={res.get('AI Scale Downs', 0)}, "
+                       f"prediction-fallbacks={res.get('AI Prediction Failures', 0)}, "
+                       f"capacity-shortfall={res.get('AI Capacity Shortfall Rate', 0):.2f}%")
+        report_lines.append(diagnostics)
         
     print(sep)
     report_lines.append(sep)
@@ -259,8 +300,9 @@ def main():
         
     print(f"\n✅ Scenario results saved to {scenario_path}")
 
-    # Generate plots for the last scenario (usually Baseline/Normal or Gradual Growth)
-    print("📊 Generating comparison plots...")
+    # The per-scenario plots were saved under outputs/scenarios/<scenario>/.
+    # Keep the legacy top-level plots as a clearly labelled Gradual Growth view.
+    print("📊 Generating final-scenario reference plots (Gradual Growth)...")
     visualizer.plot_utilization_comparison(baseline_results, ai_results, threshold_results,
                                          save_path='outputs/utilization_comparison.png')
     visualizer.plot_cost_efficiency(baseline_results, ai_results, threshold_results,
@@ -269,85 +311,56 @@ def main():
                                           save_path='outputs/time_series_utilization.png')
 
     
-    # Final summary
-    # Final summary with Academic Reporting
+    # Aggregate summary across all five scenarios. Utilization/SLA/efficiency
+    # are equal-weight scenario means; cost is summed across scenario runs.
     print("="*105)
-    print("                             EXPERIMENT SUMMARY TABLE (3-WAY)")
+    print("                 AGGREGATE EXPERIMENT SUMMARY (ALL SCENARIOS)")
     print("="*105)
-    
-    # Calculate stats
-    cpu_base = baseline_results['avg_cpu_utilization'] * 100
-    cpu_thr = threshold_results['avg_cpu_utilization'] * 100
-    cpu_ai = ai_results['avg_cpu_utilization'] * 100
-    
-    ram_base = baseline_results['avg_ram_utilization'] * 100
-    ram_thr = threshold_results['avg_ram_utilization'] * 100
-    ram_ai = ai_results['avg_ram_utilization'] * 100
-    
-    cost_base = baseline_results['total_cost']
-    cost_thr = threshold_results['total_cost']
-    cost_ai = ai_results['total_cost']
-    
-    eff_base = baseline_results['avg_efficiency']
-    eff_thr = threshold_results['avg_efficiency']
-    eff_ai = ai_results['avg_efficiency']
-    
-    sla_base = baseline_results.get('sla_violation_rate', 0)
-    sla_thr = threshold_results.get('sla_violation_rate', 0)
-    sla_ai = ai_results.get('sla_violation_rate', 0)
-    
-    # helper for formatting strings
+
+    def mean_metric(key):
+        return float(np.mean([entry[key] for entry in scenario_results_summary]))
+
+    cpu_base, cpu_thr, cpu_ai = (mean_metric(k) * 100 for k in ("Baseline CPU", "Threshold CPU", "AI CPU"))
+    ram_base, ram_thr, ram_ai = (mean_metric(k) * 100 for k in ("Baseline RAM", "Threshold RAM", "AI RAM"))
+    sla_base, sla_thr, sla_ai = (mean_metric(k) for k in ("Baseline SLA", "Threshold SLA", "AI SLA"))
+    cost_base = sum(x["Baseline Cost"] for x in scenario_results_summary)
+    cost_thr = sum(x["Threshold Cost"] for x in scenario_results_summary)
+    cost_ai = sum(x["AI Cost"] for x in scenario_results_summary)
+    eff_base, eff_thr, eff_ai = (mean_metric(k) for k in ("Baseline Efficiency", "Threshold Efficiency", "AI Efficiency"))
+
     def fmt_pct(val): return f"{val:.2f}%"
     def fmt_num(val): return f"{val:.4f}"
     def fmt_cost(val): return format_indian_currency(val)
-    
-    # Create table rows
-    header = f"{'Metric':<25} | {'Baseline':<12} | {'Threshold':<12} | {'AI-Based':<12} | {'Best Strategy':<15}"
-    sep = "-"*105
-    
-    def get_best(base, thr, ai, metric_type='high'):
-        vals = {'Baseline': base, 'Threshold': thr, 'AI': ai}
-        if metric_type == 'high':
-            best_strat = max(vals, key=vals.get)
-        else: # low (cost, sla)
-            best_strat = min(vals, key=vals.get)
-        return best_strat
-    
-    best_cpu = get_best(cpu_base, cpu_thr, cpu_ai, 'high')
-    best_ram = get_best(ram_base, ram_thr, ram_ai, 'high')
-    best_cost = get_best(cost_base, cost_thr, cost_ai, 'low')
-    best_eff = get_best(eff_base, eff_thr, eff_ai, 'high')
-    best_sla = get_best(sla_base, sla_thr, sla_ai, 'low')
+    def get_best(base, thr, ai, metric_type="high"):
+        vals = {"Baseline": base, "Threshold": thr, "AI": ai}
+        return (max if metric_type == "high" else min)(vals, key=vals.get)
 
-    row_cpu = f"{'Avg CPU Utilization':<25} | {fmt_pct(cpu_base):<12} | {fmt_pct(cpu_thr):<12} | {fmt_pct(cpu_ai):<12} | {best_cpu:<15}"
-    row_ram = f"{'Avg RAM Utilization':<25} | {fmt_pct(ram_base):<12} | {fmt_pct(ram_thr):<12} | {fmt_pct(ram_ai):<12} | {best_ram:<15}"
-    row_sla = f"{'SLA Violation Rate':<25} | {fmt_pct(sla_base):<12} | {fmt_pct(sla_thr):<12} | {fmt_pct(sla_ai):<12} | {best_sla:<15}"
-    row_cost = f"{'Total Cost (INR)':<25} | {fmt_cost(cost_base):<12} | {fmt_cost(cost_thr):<12} | {fmt_cost(cost_ai):<12} | {best_cost:<15}"
-    row_eff = f"{'Efficiency Score':<25} | {fmt_num(eff_base):<12} | {fmt_num(eff_thr):<12} | {fmt_num(eff_ai):<12} | {best_eff:<15}"
-    
+    header = f"{'Metric':<25} | {'Baseline':<12} | {'Threshold':<12} | {'AI-Based':<12} | {'Best Strategy':<15}"
+    sep = "-" * 105
+    rows = [
+        f"{'Avg CPU Utilization':<25} | {fmt_pct(cpu_base):<12} | {fmt_pct(cpu_thr):<12} | {fmt_pct(cpu_ai):<12} | {get_best(cpu_base,cpu_thr,cpu_ai):<15}",
+        f"{'Avg RAM Utilization':<25} | {fmt_pct(ram_base):<12} | {fmt_pct(ram_thr):<12} | {fmt_pct(ram_ai):<12} | {get_best(ram_base,ram_thr,ram_ai):<15}",
+        f"{'SLA Violation Rate':<25} | {fmt_pct(sla_base):<12} | {fmt_pct(sla_thr):<12} | {fmt_pct(sla_ai):<12} | {get_best(sla_base,sla_thr,sla_ai,'low'):<15}",
+        f"{'Total Cost (INR)':<25} | {fmt_cost(cost_base):<12} | {fmt_cost(cost_thr):<12} | {fmt_cost(cost_ai):<12} | {get_best(cost_base,cost_thr,cost_ai,'low'):<15}",
+        f"{'Efficiency Score':<25} | {fmt_num(eff_base):<12} | {fmt_num(eff_thr):<12} | {fmt_num(eff_ai):<12} | {get_best(eff_base,eff_thr,eff_ai):<15}"
+    ]
     table_lines = [
         "="*105,
-        "                        EXPERIMENT SUMMARY TABLE (3-WAY)",
-        "="*105,
-        header,
-        sep,
-        row_cpu,
-        row_ram,
-        row_sla,
-        row_cost,
-        row_eff,
-        sep
+        "                 AGGREGATE EXPERIMENT SUMMARY (ALL SCENARIOS)",
+        "="*105, header, sep, *rows, sep,
+        "Note: utilization, SLA and efficiency are equal-weight means across scenarios.",
+        "Note: total cost is summed across five independent scenario experiments; it is not a single deployment bill.",
+        "V5 model: requested elastic CPU/RAM are capped by provisioned fleet capacity.",
+        "Instance count is costed separately; unmet capacity remains visible in utilization and SLA metrics.",
+        "Per-scenario plots are saved under outputs/scenarios/.",
+        "All INR costs are illustrative simulation units, not provider quotations."
     ]
-    
     summary_text = "\n".join(table_lines)
     print(summary_text)
-    
-    # Save to file
     summary_path = "outputs/final_experiment_summary.txt"
-    with open(summary_path, 'w', encoding='utf-8') as f:
+    with open(summary_path, "w", encoding="utf-8") as f:
         f.write(summary_text)
-        
-    print(f"\n✅ Summary saved to {summary_path}")
+    print(f"\nAggregate summary saved to {summary_path}")
     print("\n" + "="*70 + "\n")
 
 
@@ -362,7 +375,3 @@ if __name__ == "__main__":
         import traceback
         traceback.print_exc()
         sys.exit(1)
-
-
-print("\n🚀 FINAL RESULT:")
-print("AI-based optimization reduces cloud cost by up to 87% while improving resource utilization and efficiency.")
